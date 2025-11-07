@@ -2,7 +2,8 @@ import os, time, pandas as pd, requests
 from requests.adapters import HTTPAdapter, Retry
 from tqdm import tqdm
 
-API_URL = "https://shl-recommender-1-92qj.onrender.com/recommend"
+API_URL = "https://preynsh17-SHL.hf.space/recommend"
+
 XLSX_PATH = "Gen_AI Dataset.xlsx"
 OUT_CSV = "submission.csv"
 TOP_K = 1
