@@ -1,9 +1,11 @@
 # index/search_engine.py
-import os, numpy as np, pickle
+import os, re, numpy as np, pickle
 from pathlib import Path
 
 BM25_PATH = Path("index/bm25_index.pkl")
+FAISS_PATH = Path("index/faiss_index.bin")
 META_PATH = Path("index/meta.pkl")
+
 SEMANTIC = os.environ.get("SEMANTIC", "1") == "1"
 
 with open(BM25_PATH, "rb") as f: bm25 = pickle.load(f)
@@ -11,7 +13,6 @@ with open(META_PATH, "rb") as f: meta = pickle.load(f)
 
 if SEMANTIC:
     import faiss
-    FAISS_PATH = Path("index/faiss_index.bin")
     index = faiss.read_index(str(FAISS_PATH))
     _model = None
     def get_model():
@@ -32,20 +33,94 @@ def _bm25(query):
     order = np.argsort(scores)[::-1]
     return order, scores
 
+ROLE_HINTS = {
+    "graduate":["graduate","fresher","entry","campus"],
+    "manager":["manager","lead","supervisor","team lead","people manager"],
+    "executive":["executive","director","cxo","coo","cto","ceo","vp","senior leader"]
+}
+DOMAIN_HINTS = {
+    "sales":["sales","seller","selling","quota","pipeline","bd","business development","account executive"],
+    "engineering":["engineer","developer","programmer","software","java","python","c++","coding"],
+    "customer":["support","contact center","call center","bpo"]
+}
+TYPE_HINTS = {
+    "technical":["java","python","c++","coding","developer","engineer","programming"],
+    "behavioral":["culture","fit","values","personality","communication","collaborate","interpersonal"],
+}
+
+def parse_constraints(q):
+    ql = q.lower()
+    dur = None
+    m = re.search(r"(\d+)\s*(minutes|min)\b", ql)
+    if m: dur = int(m.group(1))
+    m = re.search(r"(\d+)\s*(hours|hour|hrs|hr)\b", ql)
+    if m: dur = int(m.group(1))*60
+
+    level = None
+    if any(w in ql for w in ROLE_HINTS["graduate"]): level = "Graduate"
+    elif any(w in ql for w in ROLE_HINTS["manager"]): level = "Manager"
+    elif any(w in ql for w in ROLE_HINTS["executive"]): level = "Executive"
+
+    domain = None
+    for k, words in DOMAIN_HINTS.items():
+        if any(w in ql for w in words): domain = k; break
+
+    desired_type = None
+    if any(w in ql for w in TYPE_HINTS["technical"]): desired_type = "technical"
+    elif any(w in ql for w in TYPE_HINTS["behavioral"]): desired_type = "behavioral"
+
+    return {"duration": dur, "level": level, "domain": domain, "desired_type": desired_type}
+
+def metadata_boost(idx_list, base_scores, constraints, w_level=0.15, w_duration=0.15, w_type=0.1):
+    boosts = np.zeros_like(base_scores)
+    dur = constraints.get("duration")
+    level = constraints.get("level")
+    desired_type = constraints.get("desired_type")
+
+    for i in idx_list:
+        b = 0.0
+        if level and level in (meta["job_levels"][i] or []):
+            b += w_level
+        if dur and (meta["duration_min"][i] is not None):
+            diff = abs(meta["duration_min"][i] - dur)
+            if diff <= 10: b += w_duration
+            elif diff <= 20: b += w_duration * 0.5
+        if desired_type:
+            tt = (meta["test_types"][i] or {})
+            name = (tt.get("name") or "").lower()
+            code = (tt.get("code") or "").upper()
+            if desired_type=="technical" and (("technical" in name) or code in {"K"}):
+                b += w_type
+            if desired_type=="behavioral" and (("personality" in name or "behavior" in name) or code in {"P","C","D"}):
+                b += w_type
+        boosts[i] = b
+    return boosts
+
 def hybrid_search(query, top_k=10, w_semantic=0.7):
     order, bm = _bm25(query)
+    bm_norm = bm
+    cons = parse_constraints(query)
+
     if not SEMANTIC:
-        top = order[:top_k]
+        cand = order[: max(top_k*8, 50)]
+        boost = metadata_boost(cand, bm_norm, cons)
+        combined = bm_norm + boost
+        top = np.argsort(combined)[::-1][:top_k]
         return [{"name": meta["titles"][i], "url": meta["urls"][i],
-                 "bm25": float(bm[i]), "semantic": 0.0,
-                 "combined_score": float(bm[i])} for i in top]
+                 "bm25": float(bm_norm[i]), "semantic": 0.0,
+                 "combined_score": float(combined[i])} for i in top]
 
     q = get_model().encode([query], normalize_embeddings=True)
     D, I = index.search(q, len(meta["titles"]))
-    sem = np.zeros_like(bm)
+    sem = np.zeros_like(bm_norm)
     sem[I[0]] = _normalize(D[0])
-    combined = w_semantic * sem + (1 - w_semantic) * bm
-    top = np.argsort(combined)[::-1][:top_k]
+
+    combined = w_semantic * sem + (1 - w_semantic) * bm_norm
+    cand = np.argsort(combined)[::-1][: max(top_k*8, 100)]
+    boost = metadata_boost(cand, combined, cons)
+    combined2 = combined + boost
+    top = np.argsort(combined2)[::-1][:top_k]
+
     return [{"name": meta["titles"][i], "url": meta["urls"][i],
-             "bm25": float(bm[i]), "semantic": float(sem[i]),
-             "combined_score": float(combined[i])} for i in top]
+             "bm25": float(bm_norm[i]), "semantic": float(sem[i]),
+             "combined_score": float(combined2[i])} for i in top]
