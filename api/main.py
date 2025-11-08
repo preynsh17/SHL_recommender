@@ -10,9 +10,12 @@ class QueryRequest(BaseModel):
     top_k: int = 10
     w_semantic: float = 0.7
 
+API_VERSION = "rerank-v2"
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status":"ok","version":API_VERSION}
+
 
 @app.post("/recommend")
 def recommend(req: QueryRequest):
